@@ -70,4 +70,18 @@ sudo bash oci_ubuntu_safe_maintain.sh backup-timer
 
 ## 项目状态
 
-初版，已通过 `bash -n` 静态语法校验。尚未在真实 OCI 实例上完成端到端测试。使用前自行检查并备份。
+v0.2.0 安全加固版：已通过 `bash -n` 静态语法检查及本地模拟测试（APT 预览、备份目录失效、未验证备份禁止启用定时器）。尚未在真实 OCI 实例上完成端到端测试；请先备份并在低风险实例验证。
+
+## v0.2.0 安全修复说明
+
+- **APT**：模拟与执行均使用 `apt-get upgrade --no-remove`；不自动确认、不自动重启、不升级发行版。
+- **自动更新**：检查最终 `apt-config dump` 生效值以及两个 APT 定时器；若 timer 未启用则返回失败并提醒人工处理，不强行变更原策略。
+- **OCI**：只读检查 `iptables-save` 内常见 iSCSI 地址、Oracle Cloud Agent 和 iSCSI 服务状态。缺少地址并不一定代表故障（启动盘可能是半虚拟化的）；不会自动调整防火墙。
+- **Restic 初始化**：新配置先在 root-only 临时目录暂存，仓库连通或初始化成功才提交正式配置。连接测试上限 90 秒，用户取消时清理临时密码。需要 root SSH 密钥认证和正确的 known_hosts 指纹。
+- **备份完整性**：配置的源路径不存在则中止，不再静默跳过；数据库和运行中的 Docker 数据卷仍须单独做应用一致性备份。
+- **定时备份**：首次 `backup-now` 和 `backup-check` 必须成功；恢复校验后记录快照标识，才允许启用定时器。启用时 `Persistent=true` 可能立即补跑。
+- **Restic 全量校验**：`backup-check` 包含 `restic check` 与 `/etc/passwd` 的文件恢复验证，但不保证所有数据库/文件完整可恢复；深度校验可独立运行 `restic check --read-data-subset=1/20`（会消耗流量）。
+
+使用顺序：`audit` → 在 OCI 控制台制作启动盘备份 → `backup-setup` → `backup-now` → `backup-check` → `pro` → `auto-security` → （维护窗口）`patch` → `backup-timer`。
+
+**重要限制**：修改 `auto-security`、`pro` 或 `patch` 仍可能安装软件包并重启服务；建议先在非关键实例试运行。旧 Ubuntu 镜像/仓库、第三方 PPA、OCI 网络/iSCSI 启动方式均有差异，脚本不能保证零风险。
