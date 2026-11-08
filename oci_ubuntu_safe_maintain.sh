@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OCI Ubuntu LTS safe-maintenance helper (2026-11)
+# OCI Ubuntu LTS safe-maintenance helper v0.2.0 (2026-11)
 # Supported target: Ubuntu 18.04 / 20.04 / 22.04 / 24.04, amd64 or arm64.
 # Usage:
 #   sudo bash oci_ubuntu_safe_maintain.sh                 # interactive menu
@@ -24,6 +24,7 @@ PASS_FILE="$CONFIG_DIR/restic-password"
 PATHS_FILE="$CONFIG_DIR/restic-paths"
 INSTALLED_SCRIPT=/usr/local/sbin/oci-ubuntu-safe-maintain
 TIMER_NAME=oci-restic-backup.timer
+VERIFIED_FILE="$CONFIG_DIR/restic-verified"
 
 say()  { printf '\n\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 warn() { printf '\n\033[1;33m[注意]\033[0m %s\n' "$*" >&2; }
@@ -105,169 +106,214 @@ inspect() {
     '2. 检查 NSG/Security List：SSH 仅允许可信来源；数据库/面板不要裸露公网。' \
     '3. 提前测试 OCI 串口控制台；确认实例的 ARM 免费配额状态。' \
     '4. 如使用第三方 Docker / Node / PHP / 数据库，需单独核对其安全支持周期。'
+  section 'OCI 专项检查（只读）'
+  if command -v iptables-save >/dev/null 2>&1; then
+    if iptables-save 2>/dev/null | grep -Eq '169[.]254[.](0[.]2|2[.])'; then
+      say 'iptables 中发现 OCI iSCSI 相关地址；仍需人工确认规则完整。'
+    else
+      warn '未在 iptables-save 中发现常见 iSCSI 地址；使用半虚拟化启动盘或 nftables 的机器可能正常，请人工核查，勿自动修复。'
+    fi
+  else
+    warn '未找到 iptables-save，无法检查 OCI iSCSI 规则。'
+  fi
+  if command -v snap >/dev/null 2>&1; then
+    snap list oracle-cloud-agent 2>/dev/null || warn '未发现 snap 版 Oracle Cloud Agent（不代表所有 OCI 镜像异常）。'
+    snap services oracle-cloud-agent 2>/dev/null || true
+  fi
+  for unit in iscsid.service open-iscsi.service; do
+    printf '%s: ' "$unit"; systemctl is-active "$unit" 2>/dev/null || true
+  done
+  warn '以上检查不会修改 iptables、网络、OCI Agent 或 iSCSI；也不能自动识别 OCI 免费配额及控制台配置。'
   warn '分享输出前请遮盖公网 IP、域名、主机名、账号信息与敏感容器名称。'
 }
 
 setup_pro() {
   require_maintained_lts
-  section '启用 Ubuntu Pro ESM（不会升级 Ubuntu 大版本）'
-  warn '此操作会添加 Ubuntu Pro 软件源，可能触发额外软件包更新；建议先创建 OCI 启动盘备份。'
-  warn '必须用你或家人自己符合使用条款的 Ubuntu Pro 订阅，并在网页上完成授权。不要把 token 复制到聊天。'
+  section '绑定 Ubuntu Pro 并开启 ESM（不升级 Ubuntu 大版本）'
+  warn '先在 OCI 控制台做好启动盘备份；Ubuntu Pro 可能新增 APT 软件源。'
+  warn '只使用本人有权使用的订阅。不要公开 Pro Token。'
   confirm_word PRO
   if ! command -v pro >/dev/null 2>&1; then
-    say '安装 ubuntu-pro-client（Ubuntu 18.04 的旧仓库可能使用 ubuntu-advantage-tools 包名）...'
     apt-get update
     if ! apt-get install ubuntu-pro-client; then
       apt-get install ubuntu-advantage-tools
     fi
   fi
   need_cmd pro
-  say '当前状态：'
-  LC_ALL=C pro status || true
   local status
-  status="$(LC_ALL=C pro status 2>&1 || true)"
+  status="$(LC_ALL=C pro status 2>&1)" || die '无法读取 Ubuntu Pro 状态；请先排查 pro status。'
+  printf '%s\n' "$status"
   if grep -Eqi 'not attached|not subscribed' <<<"$status"; then
-    say '启动网页配对流程（不自动启用 Livepatch 等服务）...'
+    warn '将执行 pro attach --no-auto-enable，避免意外开启 Livepatch 等其他服务。'
     pro attach --no-auto-enable
-  else
-    warn '状态未显示「not attached」，暂不重复绑定；尝试直接启用 ESM。'
+  elif ! grep -Eqi '^[[:space:]]*(Account|Subscription):' <<<"$status"; then
+    die '无法确认当前 Pro 已绑定；为避免重复绑定或误改订阅，请手动运行 pro status。'
   fi
-  say '启用 esm-infra（若已启用则保持原状态）...'
   pro enable esm-infra
-  say '启用 esm-apps（若已启用则保持原状态）...'
   pro enable esm-apps
-  pro status || true
-  say 'ESM 已处理。补丁并不会由此立即全部安装；检查后选择 patch。'
+  status="$(LC_ALL=C pro status 2>&1)" || die 'ESM 操作完成但无法验证状态。'
+  printf '%s\n' "$status"
+  for service in esm-infra esm-apps; do
+    if ! grep -Eiq "^[[:space:]]*${service}[[:space:]]+.*enabled" <<<"$status"; then
+      warn "未能从状态中确认 $service 已启用，请人工复核（不同 Pro 版本输出可能不同）。"
+    fi
+  done
+  say '已尝试启用 ESM；请检查 pro status 和 apt list --upgradable。'
 }
 
 setup_auto_updates() {
   require_maintained_lts
-  section '启用默认 Ubuntu/ESM 自动安全补丁，无人值守自动重启关闭'
-  warn 'Ubuntu 默认 unattended-upgrades 会使用其原有的允许源配置，本脚本不改动 Allowed-Origins，也不纳入第三方 PPA。'
-  warn '安装安全补丁依然可能重启某些服务；需要开机重启时必须由你手动进行。'
+  section '配置 Ubuntu/ESM 自动安全更新（禁止自动重启）'
+  warn '不会扩充第三方软件源；自动安装补丁仍可能重启应用服务。'
   confirm_word AUTO
   if ! dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q 'install ok installed'; then
     apt-get update
     apt-get install unattended-upgrades
   fi
+  need_cmd apt-config
   local target=/etc/apt/apt.conf.d/95-oci-safe-maintenance
   if [[ -e "$target" ]]; then
     cp -a -- "$target" "${target}.bak.$(date +%Y%m%d%H%M%S)"
   fi
   cat > "$target" <<'APTCONF'
-// OCI old Ubuntu: keep existing Ubuntu/ESM origin rules.
+// OCI old Ubuntu: retain existing Ubuntu and Pro ESM allowed origins.
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 Unattended-Upgrade::Automatic-Reboot "false";
 APTCONF
   chmod 0644 "$target"
-  say "已写入 $target"
-  apt-config dump | grep -E '(Periodic::Unattended-Upgrade|Periodic::Update-Package-Lists|Unattended-Upgrade::Automatic-Reboot)' || true
-  say '检查 apt-daily 与 apt-daily-upgrade timers；不强制 enable/now，以免覆盖已有运维策略。'
-  for unit in apt-daily.timer apt-daily-upgrade.timer; do
-    printf '%s: ' "$unit"; systemctl is-enabled "$unit" 2>/dev/null || true
+  local effective
+  effective="$(apt-config dump)" || die 'apt-config 无法解析当前配置。'
+  for expectation in 'APT::Periodic::Update-Package-Lists "1";' 'APT::Periodic::Unattended-Upgrade "1";' 'Unattended-Upgrade::Automatic-Reboot "false";'; do
+    grep -Fxq "$expectation" <<<"$effective" || die "配置未生效或被其他文件覆盖：$expectation"
   done
-  warn '若上述 timers 显示 disabled/masked，需另行检查已有运维配置后决定是否启用。'
+  local ok=1 unit state
+  for unit in apt-daily.timer apt-daily-upgrade.timer; do
+    state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    printf '%s: %s\n' "$unit" "${state:-unknown}"
+    [[ "$state" == enabled ]] || ok=0
+  done
+  if (( ! ok )); then
+    warn 'APT 定时器未全部启用，配置文件已写入，但无法保证自动安全更新执行。为避免干预现有策略，不会自行启用；请人工检查。'
+    return 1
+  fi
+  say 'APT 有效配置与两个定时器已验证；可在维护窗口手动运行 unattended-upgrade --dry-run 检查。'
 }
 
 manual_patch() {
   require_maintained_lts
-  section '手动安装可用软件包更新（非 Ubuntu 大版本升级）'
-  warn '请先做 OCI 启动盘备份 + Restic 数据备份；apt 可能更新内核或重启应用服务。'
-  say '先刷新 APT 索引并模拟升级；如有问题将停止。'
+  section '人工确认后安装 APT 常规更新（非系统发行版升级）'
+  warn '更新内核、SSH、iSCSI、网络或 Docker 相关包前必须先备份，并确认 OCI 串口控制台可用。'
   apt-get update
-  apt-get -s upgrade
-  warn '确认以上计划无不兼容软件包、删除操作或关键业务风险后再继续。'
+  # Important: use the same front-end/options for simulation and execution.
+  apt-get -s upgrade --no-remove
+  warn '请审阅模拟结果，不要在确认前更改软件源。此操作仍可能重启服务。'
   confirm_word PATCH
-  # Intentionally interactive: no -y, no release upgrade, no reboot.
-  apt upgrade
+  apt-get upgrade --no-remove
   if [[ -e /var/run/reboot-required ]]; then
-    warn '更新后需要重启。脚本不会重启；请在测试串口控制台后选维护窗口重启。'
+    warn '已提示需要重启；本脚本绝不自动重启。'
   fi
 }
 
 restic_ready() {
   need_cmd restic
-  [[ -s "$REPO_FILE" && -s "$PASS_FILE" && -s "$PATHS_FILE" ]] || \
-    die '尚未完成备份初始化；先运行 backup-setup。'
-  [[ "$(stat -c %a "$PASS_FILE")" == 600 ]] || warn 'Restic 密码文件权限不是 600，请立即修正。'
+  [[ -s "$REPO_FILE" && -s "$PASS_FILE" && -s "$PATHS_FILE" ]] || die '缺少完整的 Restic 配置。'
+  [[ -d "$CONFIG_DIR" && ! -L "$CONFIG_DIR" ]] || die 'Restic 配置目录异常。'
+  [[ "$(stat -c %a "$CONFIG_DIR")" == 700 ]] || die 'Restic 配置目录权限必须为 700。'
+  [[ -f "$PASS_FILE" && ! -L "$PASS_FILE" ]] || die 'Restic 密码文件不是普通文件。'
+  [[ "$(stat -c %a "$PASS_FILE")" == 600 ]] || die 'Restic 密码文件权限必须为 600。'
+  [[ "$(stat -c %u "$PASS_FILE")" == 0 ]] || die 'Restic 密码文件必须属于 root。'
 }
 restic_run() {
   restic -r "$(cat "$REPO_FILE")" --password-file "$PASS_FILE" "$@"
 }
 
+
 setup_backup() {
   require_maintained_lts
-  section '初始化 Restic 加密异地备份（SFTP）'
-  warn '备份目的地应是 OCI 以外、独立控制的 SFTP 存储；请自行确认空间、费用和 SSH 主机指纹。'
-  warn '不要将仓库存放到本机系统盘作为唯一备份；两台机器请使用不同的仓库目录；数据库需要额外的一致性导出。'
-  [[ ! -e "$REPO_FILE" && ! -e "$PASS_FILE" ]] || \
-    die '检测到已有备份配置。为避免覆盖密钥或备份仓库，本脚本拒绝再次初始化。'
+  section '初始化 Restic 加密 SFTP 异地备份'
+  warn '请先确认远程 SSH 主机指纹，以及 root 的密钥认证；不要在服务器保存 SFTP 登录密码。'
+  warn '存储费用、流量和备份空间需要你自行确认；不能把 OCI 内部存储当作唯一备份。'
+  [[ ! -e "$REPO_FILE" && ! -e "$PASS_FILE" && ! -e "$PATHS_FILE" ]] || die '已有 Restic 配置，拒绝覆盖。'
   confirm_word BACKUP
   if ! command -v restic >/dev/null 2>&1; then
     apt-get update
     apt-get install restic
   fi
-  require_tty
-  local repo password confirm_password newpath reply
-  printf '远端 Restic 仓库（示例 sftp:backup@backup.example:/srv/restic/server1）: '
+  need_cmd timeout
+  local repo password confirm_password newpath reply tempdir temp_pass
+  printf '远端 Restic 仓库，例如 sftp:backup@backup.example:/srv/restic/server1: '
   IFS= read -r repo
-  [[ "$repo" == sftp:* && "$repo" != *$'\n'* ]] || die '此版本仅自动配置 sftp: 仓库，防止本机备份误认为异地备份。'
-  read -r -s -p '设定新的 Restic 加密口令（>=16 字符）：' password; printf '\n'
-  [[ ${#password} -ge 16 ]] || die '口令过短。'
+  [[ "$repo" =~ ^sftp:[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:/[A-Za-z0-9._/-]+$ ]] || die '请用 sftp:user@host:/absolute/path 格式。'
+  read -r -s -p '设定 Restic 加密口令（至少 16 字符）：' password; printf '\n'
+  [[ ${#password} -ge 16 ]] || die '加密口令长度不足。'
   read -r -s -p '再次输入口令：' confirm_password; printf '\n'
   [[ "$password" == "$confirm_password" ]] || die '两次口令不一致。'
   install -d -m 0700 "$CONFIG_DIR"
-  printf '%s\n' "$repo" > "$REPO_FILE"
-  printf '%s\n' "$password" > "$PASS_FILE"
+  tempdir="$(mktemp -d "$CONFIG_DIR/.staging.XXXXXXXX")" || die '创建临时配置目录失败。'
+  # On abort/CTRL-C, remove staged secrets instead of leaving a half-configured state.
+  trap 'if [[ -n "${tempdir:-}" && -d "$tempdir" ]]; then rm -rf -- "$tempdir"; fi' EXIT
+  temp_pass="$tempdir/password"
+  printf '%s\n' "$password" > "$temp_pass"
   unset password confirm_password
-  chmod 0600 "$REPO_FILE" "$PASS_FILE"
-  : > "$PATHS_FILE"
+  chmod 0600 "$temp_pass"
+  local -a paths=()
   for newpath in /etc /home /root /opt /srv /var/www; do
-    [[ -d "$newpath" ]] && printf '%s\n' "$newpath" >> "$PATHS_FILE"
+    [[ -d "$newpath" ]] && paths+=("$newpath")
   done
-  say '已预置存在的 /etc、/home、/root、/opt、/srv、/var/www。'
-  warn '默认不包含正在运行的 Docker 卷或数据库，因为直接复制可能导致不一致。'
-  printf '是否额外加入 /var/lib/docker/volumes（仅限已停写/已做数据库导出的情况）？输入 YES 添加: '
+  warn '默认不包含 /var/lib/docker、数据库在线文件；请先制作应用一致性备份。'
+  printf '如已停写并确认一致性，是否添加 Docker 卷目录？输入 YES: '
   IFS= read -r reply
-  if [[ "$reply" == YES && -d /var/lib/docker/volumes ]]; then
-    printf '%s\n' /var/lib/docker/volumes >> "$PATHS_FILE"
-  fi
+  if [[ "$reply" == YES && -d /var/lib/docker/volumes ]]; then paths+=(/var/lib/docker/volumes); fi
   while :; do
-    printf '输入其他需要备份的绝对目录路径（回车结束）：'
+    printf '额外备份目录（必须是现存绝对路径；回车结束）： '
     IFS= read -r newpath
     [[ -z "$newpath" ]] && break
-    [[ "$newpath" == /* && -d "$newpath" ]] || { warn '必须是现存绝对目录。'; continue; }
-    [[ "$newpath" != / && "$newpath" != "$CONFIG_DIR" ]] || { warn '为避免过度备份或存储密码文件，拒绝该路径。'; continue; }
-    printf '%s\n' "$newpath" >> "$PATHS_FILE"
+    [[ "$newpath" == /* && -d "$newpath" ]] || { warn '请输入现有绝对目录。'; continue; }
+    case "$newpath" in
+      /|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*|/tmp|/tmp/*|"$CONFIG_DIR"|"$CONFIG_DIR"/*) warn '该路径禁止作为备份根目录。'; continue;;
+    esac
+    paths+=("$newpath")
   done
-  chmod 0600 "$PATHS_FILE"
-  say '正在测试仓库连接。初次连接请核实服务器 SSH host key 指纹。'
-  if restic_run snapshots >/dev/null 2>&1; then
-    say '连接到已有仓库成功，未执行 init。'
+  ((${#paths[@]}>0)) || { rm -rf -- "$tempdir"; die '没有有效备份目录。'; }
+  printf '%s\n' "${paths[@]}" > "$tempdir/paths"
+  printf '%s\n' "$repo" > "$tempdir/repository"
+  chmod 0600 "$tempdir/paths" "$tempdir/repository"
+  warn '开始非交互式连接测试（最多 90 秒）。连接失败可能意味着目录不存在、认证失败或已有仓库密码不匹配。'
+  if timeout 90 restic -r "$repo" --password-file "$temp_pass" snapshots </dev/null >/dev/null 2>&1; then
+    say '现有仓库连接成功。'
   else
-    warn '不能读取现有仓库：可能是一个新路径，也可能是 SSH/网络/密码错误。请先确认。'
+    warn '无法读取现有仓库。仅当你确认这是一个全新的远端空目录、SSH 密钥正常且指纹可信时才输入 INIT。'
     confirm_word INIT
-    restic_run init
+    if ! timeout 90 restic -r "$repo" --password-file "$temp_pass" init </dev/null; then
+      rm -rf -- "$tempdir"
+      die '远端初始化失败：正式配置未写入，检查 SSH 和仓库路径后重试。'
+    fi
   fi
-  say '备份配置完成；务必把 Restic 加密口令另存密码管理器，遗失口令无法恢复数据。'
-  say '使用 backup-now 首次备份、backup-check 验证，之后才能启用 backup-timer。'
+  # Publish configuration only after the repository was opened or initialized.
+  mv -- "$tempdir/repository" "$REPO_FILE"
+  mv -- "$temp_pass" "$PASS_FILE"
+  mv -- "$tempdir/paths" "$PATHS_FILE"
+  rmdir -- "$tempdir"
+  tempdir=""
+  trap - EXIT
+  chmod 0600 "$REPO_FILE" "$PASS_FILE" "$PATHS_FILE"
+  say '备份仓库已配置。首次执行 backup-now 后，还必须运行 backup-check 才能启用 timer。'
 }
 
 backup_now() {
   restic_ready
-  local -a paths=() listed=()
-  mapfile -t listed < "$PATHS_FILE"
+  local -a paths=()
+  mapfile -t paths < "$PATHS_FILE"
   local item
-  for item in "${listed[@]}"; do
-    [[ -d "$item" || -f "$item" ]] && paths+=("$item") || warn "路径已不存在，跳过：$item"
+  ((${#paths[@]}>0)) || die '备份路径列表为空。'
+  for item in "${paths[@]}"; do
+    [[ "$item" == /* && "$item" != / && ( -d "$item" || -f "$item" ) ]] || die "备份路径不存在或不安全：$item（已停止，避免生成不完整快照）。"
   done
-  [[ ${#paths[@]} -gt 0 ]] || die '没有可用的备份路径。'
   section '创建 Restic 加密备份快照'
-  warn '运行中数据库和 Docker 卷不能仅靠文件复制保证一致性，请确保额外导出或停写。'
-  # Never put the repository encryption password back into its own backups.
+  warn '对运行中的数据库和 Docker 数据卷必须单独进行一致性备份。'
   restic_run backup --exclude "$CONFIG_DIR" --tag oci-safe-maintain "${paths[@]}"
-  say '备份完成；下一步运行 backup-check。'
+  say '备份完成；运行 backup-check 验证恢复。'
 }
 
 backup_list() {
@@ -275,41 +321,50 @@ backup_list() {
   restic_run snapshots
 }
 
+latest_snapshot_id() {
+  need_cmd python3
+  restic_run snapshots --json --host "$(hostname)" | python3 -c 'import json,sys; snaps=json.load(sys.stdin); matches=[s for s in snaps if "oci-safe-maintain" in s.get("tags",[])]; print(matches[-1].get("id", "") if matches else "")'
+}
 backup_check() {
   restic_ready
-  section '检查 Restic 仓库结构（不代表读取验证了所有数据块）'
+  section '验证仓库索引与结构（不自动读取全部数据块）'
   restic_run check
-  section '将 /etc/passwd 恢复到 root 专用临时目录，验证实际文件读取（不会显示内容）'
-  local dir
+  local id dir
+  id="$(latest_snapshot_id)" || die '获取最新快照失败。'
+  [[ -n "$id" ]] || die '本机还没有带 oci-safe-maintain 标签的备份快照。'
   dir="$(mktemp -d /tmp/oci-restic-restore.XXXXXXXX)"
-  if restic_run restore latest --host "$(hostname)" --target "$dir" --include /etc/passwd; then
-    [[ -s "$dir/etc/passwd" && ! -L "$dir/etc/passwd" ]] || die "恢复测试未产生有效普通文件，请检查：$dir"
-    say '恢复测试成功（不会打印账号清单或覆盖原系统）。'
-    rm -f -- "$dir/etc/passwd"
-    rmdir -- "$dir/etc" "$dir" 2>/dev/null || true
+  if restic_run restore "$id" --target "$dir" --include /etc/passwd && [[ -s "$dir/etc/passwd" && ! -L "$dir/etc/passwd" ]]; then
+    rm -rf -- "$dir"
+    printf '%s %s\n' "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$VERIFIED_FILE"
+    chmod 0600 "$VERIFIED_FILE"
+    say '仓库检查与测试文件恢复成功。标记已验证快照。'
   else
-    warn "恢复测试失败。检查临时目录：$dir"
-    return 1
+    rm -rf -- "$dir"
+    die '文件恢复验证失败；定时备份不会据此解锁。'
   fi
-  say '建议定期另做数据库/应用的完整恢复演练。'
+  warn '这不是完整恢复演练。可在维护窗口使用 restic check --read-data-subset=1/20 做额外数据块抽检。'
 }
 
 backup_timer() {
   restic_ready
-  command -v systemctl >/dev/null 2>&1 || die '缺少 systemctl。'
-  section '配置每日 systemd Restic 异地备份'
-  warn '先确认 backup-now 和 backup-check 均通过；每日备份会产生远端存储占用/流量与潜在账单。'
-  warn '仅安装定时备份，不执行自动 prune（避免误删旧快照）。'
+  need_cmd systemctl
+  section '启用每天一次的 systemd Restic 备份'
+  [[ -s "$VERIFIED_FILE" ]] || die '还没有验证记录；必须先运行 backup-now 和 backup-check。'
+  [[ "$(stat -c %a "$VERIFIED_FILE")" == 600 ]] || die '验证记录权限错误。'
+  local id verified_id checked_at source_path
+  id="$(latest_snapshot_id)" || die '无法读取当前快照。'
+  read -r verified_id checked_at < "$VERIFIED_FILE"
+  [[ -n "$id" && "$id" == "$verified_id" ]] || die '验证记录与最新快照不一致；请重新执行 backup-check。'
+  warn '启用后 Persistent=true 可能使定时任务立即补跑；请确认 SFTP 目的地、存储费用和资源余量。'
   confirm_word TIMER
-  local source_path
   source_path="$(readlink -f -- "$0")"
-  [[ -r "$source_path" ]] || die "无法读取脚本本体：$source_path"
+  [[ -r "$source_path" ]] || die '无法读取脚本本体。'
   if [[ "$source_path" != "$INSTALLED_SCRIPT" ]]; then
     install -m 0700 "$source_path" "$INSTALLED_SCRIPT"
   fi
   cat > /etc/systemd/system/oci-restic-backup.service <<'UNIT'
 [Unit]
-Description=OCI Ubuntu Restic data backup (no upgrade)
+Description=OCI Ubuntu Restic encrypted data backup
 Wants=network-online.target
 After=network-online.target
 [Service]
@@ -332,16 +387,18 @@ Unit=oci-restic-backup.service
 WantedBy=timers.target
 UNIT
   chmod 0644 /etc/systemd/system/oci-restic-backup.{service,timer}
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze verify /etc/systemd/system/oci-restic-backup.{service,timer} || die 'systemd 单元验证失败；未启用定时器。'
+  fi
   systemctl daemon-reload
   systemctl enable --now "$TIMER_NAME"
   systemctl list-timers --all "$TIMER_NAME" --no-pager || true
-  say '定时备份已启用：每天约 03:30（服务器本地时区）+ 最多 45 分钟随机延迟。'
-  say '检查日志：sudo journalctl -u oci-restic-backup.service -n 100 --no-pager'
+  say '定时备份已启用。请用 journalctl -u oci-restic-backup.service 检查后续运行结果。'
 }
 
 help_text() {
   cat <<'HELP'
-OCI Ubuntu 老实例安全维护助手（Ubuntu 18.04/20.04/22.04/24.04）
+OCI Ubuntu 老实例安全维护助手 v0.2.0（Ubuntu 18.04/20.04/22.04/24.04）
 
 sudo bash oci_ubuntu_safe_maintain.sh [命令]
 
